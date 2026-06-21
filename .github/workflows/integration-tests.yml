@@ -29,7 +29,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Compile Vortex Router
-        run: cargo build --release
+        run: |
+          cargo update -p sfv --precise 0.10.4
+          cargo build --release
 
       - name: Spin up Test Environment
         run: |
