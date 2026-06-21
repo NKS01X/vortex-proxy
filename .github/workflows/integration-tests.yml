@@ -1,4 +1,4 @@
-name: Vortex Integration Testname: Vortex Intname: Vortex Integration Tests
+name: Vortex Integration Tests
 
 on:
   push:
