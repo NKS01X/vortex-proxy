@@ -16,5 +16,5 @@ serde = { version = "1.0", features = ["derive"] }
 # Match the tonic version
 tonic-build = "0.12" 
 
-[patch.crates-io]
+[replace]
 sfv = { version = "0.10.4" }
