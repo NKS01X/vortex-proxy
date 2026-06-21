@@ -1,0 +1,76 @@
+name: Vortex Integration Tests
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+
+jobs:
+  e2e-routing-test:
+    name: End-to-End Routing Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update 
+          sudo apt-get install -y protobuf-compiler
+          go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile Vortex Router
+        run: cargo build --release
+
+      - name: Spin up Test Environment
+        run: |
+          docker network create vortex-net
+          docker run -d --name kind-db --network vortex-net -p 50051:50051 nks01x/kind-db:latest
+          docker run -d --name backend-1 --network vortex-net nginxdemos/hello:plain-text
+          docker run -d --name backend-2 --network vortex-net nginxdemos/hello:plain-text
+          sleep 3
+
+      - name: Inject Test Route into Kind DB
+        run: |
+          grpcurl -plaintext -import-path ./proto -proto kind.proto \
+            -d '{"key": "router:testapp", "value": "eyJjbGllbnRfaWQiOiAidGVzdGFwcCIsICJpcHMiOiBbImJhY2tlbmQtMTo4MCIsICJiYWNrZW5kLTI6ODAiXX0="}' \
+            localhost:50051 kind.KindService/Put
+
+      - name: Start Vortex Router
+        env:
+          KIND_DB_URL: http://localhost:50051
+        run: |
+          nohup ./target/release/vortex-router > router.log 2>&1 &
+          sleep 3
+
+      - name: Verify Live Routing
+        run: |
+          echo "Sending test request to proxy..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: testapp.vortex.cloud" http://localhost:8000)
+          
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "Integration Test Passed! Proxy successfully routed traffic."
+            curl -s -H "Host: testapp.vortex.cloud" http://localhost:8000
+            exit 0
+          else
+            echo "Integration Test Failed! Expected HTTP 200, got HTTP $HTTP_STATUS."
+            echo "--- DUMPING ROUTER LOGS ---"
+            cat router.log
+            exit 1
+          fi
+
+      - name: Upload Router Logs
+        if: always() 
+        uses: actions/upload-artifact@v4
+        with:
+          name: vortex-proxy-logs
+          path: router.log
