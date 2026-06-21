@@ -37,12 +37,13 @@ impl ProxyHttp for VortexRouter {
         let host = host_header.and_then(|v| v.to_str().ok()).unwrap_or("");
         
         let client_id = host.split('.').next().unwrap_or("");
+        println!("[PROXY] Incoming request for Host: '{}' | Extracted Client ID: '{}'", host, client_id);
         
         if client_id.is_empty() {
             let _ = session.respond_error(502).await;
             return Err(pingora::Error::explain(
                 pingora::ErrorType::Custom("No client ID"),
-                "No client ID",
+                "No client ID provided in Host header",
             ));
         }
 
@@ -50,27 +51,33 @@ impl ProxyHttp for VortexRouter {
             let table = self.routing_table.read().await;
             table.get(client_id).cloned()
         };
+        
+        println!("[PROXY] Routing table lookup for '{}' found: {:?}", client_id, ips);
 
         let ip = match ips {
             Some(list) if !list.is_empty() => {
                 let idx = self.request_counter.fetch_add(1, Ordering::Relaxed) % list.len();
-                list[idx].clone()
+                let selected_ip = list[idx].clone();
+                println!("[PROXY] Routing to backend IP: {}", selected_ip);
+                selected_ip
             }
             _ => {
+                println!("[PROXY] FATAL: No backends available! Returning 502.");
                 let _ = session.respond_error(502).await;
                 return Err(pingora::Error::explain(
                     pingora::ErrorType::Custom("No backends"),
-                    "No backends available",
+                    "No backends available for this client",
                 ));
             }
         };
 
+        // ... (Metrics section stays exactly the same)
         {
             let table = self.metrics_table.read().await;
             if let Some(counter) = table.get(client_id) {
                 counter.fetch_add(1, Ordering::Relaxed);
             } else {
-                drop(table);
+                drop(table); 
                 let mut write_table = self.metrics_table.write().await;
                 write_table
                     .entry(client_id.to_string())
@@ -97,72 +104,123 @@ struct MetricUpdate<'a> {
 }
 
 pub async fn run_kind_db_watcher(table: RoutingTable) {
-    if let Ok(mut client) = KindServiceClient::connect("http://localhost:50051").await {
-        let req = WatchRequest {
-            prefix: "router:".to_string(),
-        };
-        if let Ok(response) = client.watch(tonic::Request::new(req)).await {
-            let mut stream = response.into_inner();
-            while let Ok(Some(res)) = stream.message().await {
-                if res.operation_type == "PUT" {
-                    if let Ok(update) = serde_json::from_slice::<RouteUpdate>(&res.new_value) {
-                        let mut write_guard = table.write().await;
-                        write_guard.insert(update.client_id, update.ips);
+    let db_url = std::env::var("KIND_DB_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+
+    loop {
+        println!("[WATCHER] Attempting to connect to Kind DB at: {}", db_url);
+        match KindServiceClient::connect(db_url.clone()).await {
+            Ok(mut client) => {
+                println!("[WATCHER] Connected to Kind DB! Opening Watch stream...");
+                let req = WatchRequest { prefix: "router:".to_string() };
+                
+                if let Ok(response) = client.watch(tonic::Request::new(req)).await {
+                    let mut stream = response.into_inner();
+                    
+                    while let Ok(Some(res)) = stream.message().await {
+                        // Because of the proto tag shift:
+                        // res.operation_type holds the DB Key (e.g., "router:myapp")
+                        // res.key holds the JSON String
+                        println!("[WATCHER] Received DB Event! DB_Key: {}, Payload: {}", res.operation_type, res.key);
+                        
+                        // 1. Check if the DB key starts with "router:"
+                        if res.operation_type.starts_with("router:") {
+                            
+                            // 2. Parse the JSON payload directly from the res.key string
+                            match serde_json::from_str::<RouteUpdate>(&res.key) {
+                                Ok(update) => {
+                                    println!("[WATCHER] SUCCESS! Parsed route update for '{}': {:?}", update.client_id, update.ips);
+                                    let mut write_guard = table.write().await;
+                                    write_guard.insert(update.client_id, update.ips);
+                                }
+                                Err(e) => {
+                                    println!("[WATCHER] ERROR: Failed to parse JSON! {}", e);
+                                }
+                            }
+                        }
                     }
+                    println!("[WATCHER] Stream disconnected.");
                 }
             }
+            Err(e) => println!("[WATCHER] Connection failed: {}. Retrying in 2s...", e),
         }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
-
 pub async fn run_metrics_publisher(metrics: MetricsTable) {
-    if let Ok(mut client) = KindServiceClient::connect("http://localhost:50051").await {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let db_url = std::env::var("KIND_DB_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
-            let mut updates = Vec::new();
-            {
-                let table = metrics.read().await;
-                for (client_id, counter) in table.iter() {
-                    let rps = counter.swap(0, Ordering::Relaxed);
-                    if rps > 0 {
-                        updates.push((client_id.clone(), rps));
+    loop {
+        if let Ok(mut client) = KindServiceClient::connect(db_url.clone()).await {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                let mut updates = Vec::new();
+                {
+                    let table = metrics.read().await;
+                    for (client_id, counter) in table.iter() {
+                        let rps = counter.swap(0, Ordering::Relaxed);
+                        if rps > 0 {
+                            updates.push((client_id.clone(), rps));
+                        }
                     }
                 }
-            }
 
-            for (client_id, current_rps) in updates {
-                let payload = MetricUpdate {
-                    client_id: &client_id,
-                    current_rps,
-                };
-                if let Ok(value) = serde_json::to_vec(&payload) {
-                    let req = PutRequest {
-                        key: format!("vortex:metrics:{}", client_id),
-                        value,
+                let mut connection_alive = true;
+                for (client_id, current_rps) in updates {
+                    let payload = MetricUpdate {
+                        client_id: &client_id,
+                        current_rps,
                     };
-                    let _ = client.put(tonic::Request::new(req)).await;
+                    if let Ok(value) = serde_json::to_vec(&payload) {
+                        let req = PutRequest {
+                            key: format!("vortex:metrics:{}", client_id),
+                            value,
+                        };
+                        // If the put fails (DB crashed/restarted), break inner loop to reconnect
+                        if client.put(tonic::Request::new(req)).await.is_err() {
+                            connection_alive = false;
+                            break;
+                        }
+                    }
+                }
+                
+                if !connection_alive {
+                    break;
                 }
             }
         }
+        // Wait before trying to reconnect
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
 fn main() {
     let mut server = Server::new(None).unwrap();
+
+    // Prevent Docker from killing the container by forcing Pingora to stay in the foreground
+    if let Some(conf) = std::sync::Arc::get_mut(&mut server.configuration) {
+        conf.daemon = false;
+    }
+    
     server.bootstrap();
 
     let routing_table: RoutingTable = Arc::new(RwLock::new(HashMap::new()));
     let metrics_table: MetricsTable = Arc::new(RwLock::new(HashMap::new()));
 
     let rt_clone = routing_table.clone();
-    tokio::spawn(async move {
-        run_kind_db_watcher(rt_clone).await;
-    });
-
     let mt_clone = metrics_table.clone();
-    tokio::spawn(async move {
-        run_metrics_publisher(mt_clone).await;
+    
+    // Spawn a dedicated OS thread to run a background Tokio runtime
+    // This prevents "no reactor running" panics from Pingora's synchronous main setup
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            tokio::spawn(run_kind_db_watcher(rt_clone));
+            tokio::spawn(run_metrics_publisher(mt_clone));
+            
+            // Keep this runtime alive indefinitely to process the background loops
+            std::future::pending::<()>().await;
+        });
     });
 
     let router = VortexRouter {
@@ -175,5 +233,7 @@ fn main() {
     proxy_service.add_tcp("0.0.0.0:8000");
 
     server.add_service(proxy_service);
+    
+    // Start Pingora's worker threads
     server.run_forever();
 }
